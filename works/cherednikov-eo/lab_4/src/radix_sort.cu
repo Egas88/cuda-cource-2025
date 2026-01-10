@@ -11,7 +11,8 @@
 #define NUM_BANKS 32
 #define LOG_NUM_BANKS 5
 #define CONFLICT_FREE_OFFSET(n) (((n) >> LOG_NUM_BANKS))
-
+static constexpr int RADIX_BITS = 8;
+static constexpr int RADIX = 1 << RADIX_BITS;
 
 
  // выполнение эксклюзивного префиксного суммирования в рамках одного блока
@@ -127,27 +128,31 @@ static void scanExclusive_u32(uint32_t* d_in, uint32_t* d_out, int n) {
 
 // извлечение определенного бита из каждого элемента массива
 template<typename T>
-__global__ void extractBitKernel(const T* __restrict__ in, uint32_t* __restrict__ bits, int n, int bitPos) {
+__global__ void extractDigitKernel(const T* __restrict__ in, uint32_t* __restrict__ digitOut, int n, int shift) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        // Извлечение бита на позиции bitPos из элемента in[idx]
-        bits[idx] = (uint32_t)((((uint64_t)in[idx]) >> bitPos) & 1ull);
+		using U = typename std::make_unsigned<T>::type;
+        U v = (U)in[idx];
+        digitOut[idx] = (uint32_t)((v >> shift) & (RADIX - 1));
     }
+}
+
+
+__global__ void flagEqualsKernel(const uint32_t* __restrict__ digits, uint32_t* __restrict__ flags, int n, uint32_t k) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) flags[idx] = (digits[idx] == k) ? 1u : 0u;
 }
 
 
 //распределение элементов по новым позициям на основе битовой маски
 template<typename T>
-__global__ void scatterByBitKernel(const T* __restrict__ in, T* __restrict__ out, const uint32_t* __restrict__ scanOnes, const uint32_t* __restrict__ bits, int n, int numZeros) {
+__global__ void scatterByDigitKernel(const T* __restrict__ in, T* __restrict__ out, const uint32_t* __restrict__ digits, const uint32_t* __restrict__ scanFlags, int n, uint32_t k, uint32_t baseOffsetK) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        uint32_t b = bits[idx]; // Текущий бит элемента
-        uint32_t onesBefore = scanOnes[idx]; // Количество единиц до текущей позиции
-
-        uint32_t pos = (b == 0)
-            ? (uint32_t)idx - onesBefore
-            : (uint32_t)numZeros + onesBefore;
-        out[pos] = in[idx];
+        if (digits[idx] == k) {
+            uint32_t pos = baseOffsetK + scanFlags[idx];
+            out[pos] = in[idx];
+        }
     }
 }
 
@@ -161,62 +166,85 @@ __global__ void flipSignBitKernel(U* data, int n, U mask) {
 
 
 template<typename T>
-static void radixSortByScanBits(T* d_in, T* d_out, int n) {
+static void radixSortByScanDigits(T* d_in, T* d_out, int n) {
     if (n <= 0) return;
     T* src = d_in;
     T* dst = d_out;
 
-    uint32_t* d_bits = nullptr;
-    uint32_t* d_scan = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_bits, n * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_scan, n * sizeof(uint32_t)));
+    uint32_t* d_digits = nullptr;
+    uint32_t* d_flags  = nullptr;
+    uint32_t* d_scan   = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_digits, (size_t)n * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_flags,  (size_t)n * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_scan,   (size_t)n * sizeof(uint32_t)));
 
     int blocks = (n + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
     int numBits = (int)(sizeof(T) * 8);
+    int passes  = (numBits + RADIX_BITS - 1) / RADIX_BITS;
 
+    for (int pass = 0; pass < passes; ++pass) {
+        int shift = pass * RADIX_BITS;
 
-    for (int bit = 0; bit < numBits; ++bit) {
-        // Извлечение текущего бита из всех элементов
-        extractBitKernel<T><<<blocks, THREADS_PER_BLOCK>>>(src, d_bits, n, bit);
+        extractDigitKernel<T><<<blocks, THREADS_PER_BLOCK>>>(src, d_digits, n, shift);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // Вычисление префиксных сумм для битов (количество единиц до каждой позиции)
-        scanExclusive_u32(d_bits, d_scan, n);
+        uint32_t counts[RADIX];
+        uint32_t baseOffset[RADIX];
 
-        // Вычисление общего количества единиц и нулей
-        uint32_t lastScan = 0, lastBit = 0;
-        CUDA_CHECK(cudaMemcpy(&lastScan, d_scan + (n - 1), sizeof(uint32_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(&lastBit,  d_bits + (n - 1), sizeof(uint32_t), cudaMemcpyDeviceToHost));
-        int totalOnes = (int)(lastScan + lastBit);
-        int numZeros  = n - totalOnes;
+        for (uint32_t k = 0; k < RADIX; ++k) {
+            flagEqualsKernel<<<blocks, THREADS_PER_BLOCK>>>(d_digits, d_flags, n, k);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
 
-        // Перераспределение элементов на основе битовой маски
-        scatterByBitKernel<T><<<blocks, THREADS_PER_BLOCK>>>(src, dst, d_scan, d_bits, n, numZeros);
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
+            scanExclusive_u32(d_flags, d_scan, n);
 
-        T* tmp = src;
-		src = dst;
-		dst = tmp;
+            uint32_t lastScan = 0, lastFlag = 0;
+            CUDA_CHECK(cudaMemcpy(&lastScan, d_scan + (n - 1), sizeof(uint32_t), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(&lastFlag, d_flags + (n - 1), sizeof(uint32_t), cudaMemcpyDeviceToHost));
+            counts[k] = lastScan + lastFlag;
+        }
+
+        uint32_t sum = 0;
+        for (int k = 0; k < RADIX; ++k) {
+            baseOffset[k] = sum;
+            sum += counts[k];
+        }
+
+        for (uint32_t k = 0; k < RADIX; ++k) {
+            flagEqualsKernel<<<blocks, THREADS_PER_BLOCK>>>(d_digits, d_flags, n, k);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            scanExclusive_u32(d_flags, d_scan, n);
+
+            scatterByDigitKernel<T><<<blocks, THREADS_PER_BLOCK>>>(
+                src, dst, d_digits, d_scan, n, k, baseOffset[k]
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+
+        T* tmp = src; src = dst; dst = tmp;
     }
 
     if (src != d_out) {
         CUDA_CHECK(cudaMemcpy(d_out, src, (size_t)n * sizeof(T), cudaMemcpyDeviceToDevice));
     }
 
-    CUDA_CHECK(cudaFree(d_bits));
+    CUDA_CHECK(cudaFree(d_digits));
+    CUDA_CHECK(cudaFree(d_flags));
     CUDA_CHECK(cudaFree(d_scan));
 }
 
 
 void radix_sort_uint32(uint32_t* d_in, uint32_t* d_out, int n) {
-    radixSortByScanBits<uint32_t>(d_in, d_out, n);
+    radixSortByScanDigits<uint32_t>(d_in, d_out, n);
 }
 
 
 void radix_sort_uint64(uint64_t* d_in, uint64_t* d_out, int n) {
-    radixSortByScanBits<uint64_t>(d_in, d_out, n);
+    radixSortByScanDigits<uint64_t>(d_in, d_out, n);
 }
 
 
@@ -229,7 +257,7 @@ void radix_sort_int32(int32_t* d_in, int32_t* d_out, int n) {
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    radixSortByScanBits<uint32_t>(u_in, u_out, n);
+    radixSortByScanDigits<uint32_t>(u_in, u_out, n);
 
     flipSignBitKernel<uint32_t><<<blocks, THREADS_PER_BLOCK>>>(u_out, n, 0x80000000u);
     CUDA_CHECK(cudaGetLastError());
@@ -246,7 +274,7 @@ void radix_sort_int64(int64_t* d_in, int64_t* d_out, int n) {
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    radixSortByScanBits<uint64_t>(u_in, u_out, n);
+    radixSortByScanDigits<uint64_t>(u_in, u_out, n);
 
     flipSignBitKernel<uint64_t><<<blocks, THREADS_PER_BLOCK>>>(u_out, n, 0x8000000000000000ull);
     CUDA_CHECK(cudaGetLastError());
