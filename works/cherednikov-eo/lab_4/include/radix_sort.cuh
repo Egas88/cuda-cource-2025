@@ -4,9 +4,9 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
-const int THREADS_PER_BLOCK = 256; // потоки на блок;
-const int BITS_PER_PASS = 4; // сколько бит обрабатывается;
-const int RADIX = 1 << BITS_PER_PASS; // количество разрядов;
+constexpr int THREADS_PER_BLOCK = 256; // потоки на блок;
+constexpr int BITS_PER_PASS = 8; // сколько бит обрабатывается;
+constexpr int RADIX = 1 << BITS_PER_PASS;  // количество разрядов;
 
 // Radix Sort для 32-bit unsigned integers
 void radix_sort_uint32(uint32_t* d_data, size_t n);

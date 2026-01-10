@@ -19,6 +19,17 @@ template<typename T> bool check_sorting(T* data, size_t n) {
     return true;
 }
 
+void printArray(const uint32_t* data, int size, int maxPrint) {
+    int n = (size < maxPrint) ? size : maxPrint;
+    printf("[");
+    for (int i = 0; i < n; i++) {
+        printf("%d", data[i]);
+        if (i < n - 1) printf(", ");
+    }
+    if (size > maxPrint) printf(", ...");
+    printf("]\n");
+}
+
 
 inline void print_results(const char* type_name, size_t n, double cpu_time, float gpu_radix_time, float gpu_thrust_time) {
     printf("Benchmark: %s[%zu] OK\n", type_name, n);
@@ -124,13 +135,14 @@ void benchmark(size_t n) {
     CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(T)));
 
     generate_random_data(h_data, n, method::is_signed);
+    printArray(h_data, n, n);
     memcpy(h_cpu, h_data, n * sizeof(T));
     memcpy(h_gpu, h_data, n * sizeof(T));
     memcpy(h_thrust, h_data, n * sizeof(T));
 
     double cpu_time = cpuSort(h_cpu, n);
     float gpu_radix_time = gpu_radix_sort(d_data, h_gpu, n, method::sort);
-
+    printArray(h_gpu, n, n);
     bool correct = check_sorting(h_gpu, n);
     if (!correct) {
         printf("Benchmark: %s[%zu] FAILED\n\n", method::name, n);
@@ -146,13 +158,13 @@ void benchmark(size_t n) {
 int main() {
     srand(158);
 
-    size_t sizes[] = {1000, 100000, 5000000, 10000000};
+    size_t sizes[] = {10};
 
     for (size_t n : sizes) {
-        benchmark<int32_t>(n);
-        benchmark<int64_t>(n);
+        //benchmark<int32_t>(n);
+        //benchmark<int64_t>(n);
         benchmark<uint32_t>(n);
-        benchmark<uint64_t>(n);
+        //benchmark<uint64_t>(n);
     }
     using method = RadixMethods<int32_t>;
 
