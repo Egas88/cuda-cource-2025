@@ -13,7 +13,13 @@ make
 ## Запуск
 
 ```bash
-./radix_sort
+./radix
+```
+
+или
+
+```bash
+make run
 ```
 
 ## Результаты

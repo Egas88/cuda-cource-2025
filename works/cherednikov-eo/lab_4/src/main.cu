@@ -1,159 +1,160 @@
-#include <stdio.h>
-#include <vector>
-#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <algorithm>
-#include <stdint.h>
-#include <climits>
-#include <random>
-#include <type_traits>
+#include <chrono>
 #include <cuda_runtime.h>
+#include <thrust/device_vector.h>
 #include <thrust/sort.h>
-#include <thrust/device_ptr.h>
-#include <set>
-#include "radix_sort.cuh"
 #include "error_check.cuh"
+#include "radix_sort.cuh"
 
-using namespace std;
 
-
-template<typename T>
-vector<T> generateRandomArray(size_t length) {
-    vector<T> result;
-    result.reserve(length);
-
-    random_device rd;
-    mt19937 gen(rd());
-
-    T min_val, max_val;
-    if constexpr(is_same_v<T, uint32_t>) {
-        min_val = 0;
-        max_val = UINT32_MAX;
+template<typename T> bool check_sorting(T* data, size_t n) {
+    for (size_t i = 1; i < n; i++) {
+        if (data[i] < data[i-1]) {
+            return false;
+        }
     }
-    else if constexpr(is_same_v<T, uint64_t>) {
-        min_val = 0;
-        max_val = UINT64_MAX;
-    }
-    else if constexpr(is_same_v<T, int32_t>) {
-        min_val = INT32_MIN;
-        max_val = INT32_MAX;
-    }
-    else if constexpr(is_same_v<T, int64_t>) {
-        min_val = INT64_MIN;
-        max_val = INT64_MAX;
-    }
+    return true;
+}
 
-    uniform_int_distribution<T> dis(min_val, max_val);
-    for (size_t i = 0; i < length; i++) {
-        result.push_back(dis(gen));
-    }
 
-    return result;
+inline void print_results(const char* type_name, size_t n, double cpu_time, float gpu_radix_time, float gpu_thrust_time) {
+    printf("Benchmark: %s[%zu] OK\n", type_name, n);
+
+    printf("Time: CPU=%.5fs, GPU Radix=%.5fs, GPU Thrust=%.5fs\n",
+           cpu_time, gpu_radix_time, gpu_thrust_time);
+
+    printf("Speedup: Radix vs CPU=%.2fx, Thrust vs CPU=%.2fx, Radix vs Thrust=%.2fx\n\n",
+           cpu_time / gpu_radix_time,
+           cpu_time / gpu_thrust_time,
+           gpu_thrust_time / gpu_radix_time);
 }
 
 
 template<typename T>
-void testSort(const vector<T>& testData, const char* typeName) {
-    int n = testData.size();
-
-    printf("Benchmark: %s[%d] ", typeName, n);
-
-    // CPU sort with std::sort
-    vector<T> cpuData = testData;
-    auto cpuStart = chrono::high_resolution_clock::now();
-    sort(cpuData.begin(), cpuData.end());
-    chrono::duration<double> cpuElapsed = chrono::high_resolution_clock::now() - cpuStart;
-    double cpuTime = cpuElapsed.count();
-
-    // Allocate GPU memory
-    T* d_input;
-    T* d_output;
-    T* d_thrust_input;
-    cudaMalloc(&d_input, n * sizeof(T));
-    cudaMalloc(&d_output, n * sizeof(T));
-    cudaMalloc(&d_thrust_input, n * sizeof(T));
-
-    cudaMemcpy(d_input, testData.data(), n * sizeof(T), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_thrust_input, testData.data(), n * sizeof(T), cudaMemcpyHostToDevice);
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    // Custom GPU Radix Sort
-    auto gpuStart = chrono::high_resolution_clock::now();
-    if constexpr(is_same_v<T, uint32_t>) {
-        radixSort_uint32(d_input, d_output, n);
-    }
-    else if constexpr(is_same_v<T, int32_t>) {
-        radixSort_int32(d_input, d_output, n);
-    }
-    else if constexpr(is_same_v<T, uint64_t>) {
-        radixSort_uint64(d_input, d_output, n);
-    }
-    else if constexpr(is_same_v<T, int64_t>) {
-        radixSort_int64(d_input, d_output, n);
-    }
-    CUDA_CHECK(cudaDeviceSynchronize());
-    chrono::duration<double> gpuElapsed = chrono::high_resolution_clock::now() - gpuStart;
-    double gpuTime = gpuElapsed.count();
-
-    // Thrust::sort
-    thrust::device_ptr<T> d_thrust_ptr = thrust::device_pointer_cast(d_thrust_input);
-    auto thrustStart = chrono::high_resolution_clock::now();
-    thrust::sort(d_thrust_ptr, d_thrust_ptr + n);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    chrono::duration<double> thrustElapsed = chrono::high_resolution_clock::now() - thrustStart;
-    double thrustTime = thrustElapsed.count();
-
-    // Copy results back
-    vector<T> gpuResult(n);
-    vector<T> thrustResult(n);
-    cudaMemcpy(gpuResult.data(), d_output, n * sizeof(T), cudaMemcpyDeviceToHost);
-    cudaMemcpy(thrustResult.data(), d_thrust_input, n * sizeof(T), cudaMemcpyDeviceToHost);
-
-    // Verify correctness
-    bool radixCorrect = true;
-    bool thrustCorrect = true;
-    for (int i = 0; i < n; i++) {
-        if (cpuData[i] != gpuResult[i]) {
-            radixCorrect = false;
+void generate_random_data(T* data, size_t n, bool signed_type) {
+    for (size_t i = 0; i < n; i++) {
+        if (signed_type) {
+            // Для signed: положительные и отрицательные числа
+            data[i] = (T)((rand() % 2000000) - 1000000);
+        } else {
+            // Для unsigned: только положительные
+            data[i] = (T)(rand() % 1000000);
         }
-        if (cpuData[i] != thrustResult[i]) {
-            thrustCorrect = false;
-        }
-        if (!radixCorrect && !thrustCorrect) break;
     }
-    
-    printf("%s\n", (radixCorrect && thrustCorrect) ? "OK" : "FAILED");
-    if (!radixCorrect) printf("  WARNING: Radix Sort result incorrect!\n");
-    if (!thrustCorrect) printf("  WARNING: Thrust Sort result incorrect!\n");
-    
-    printf("Time: CPU=%.5fs, GPU Radix=%.5fs, GPU Thrust=%.5fs\n", 
-           cpuTime, gpuTime, thrustTime);
-    printf("Speedup: Radix vs CPU=%.2fx, Thrust vs CPU=%.2fx, Radix vs Thrust=%.2fx\n\n",
-           cpuTime / gpuTime, cpuTime / thrustTime, thrustTime / gpuTime);
+}
 
-    cudaFree(d_input);
-    cudaFree(d_output);
-    cudaFree(d_thrust_input);
+
+template <typename T>
+void free_all(T* h1, T* h2, T* h3, T* h4, T* d) {
+    free(h1);
+    free(h2);
+    free(h3);
+    free(h4);
+    CUDA_CHECK(cudaFree(d));
+}
+
+
+template <typename T>
+double cpuSort(T* data, size_t  n) {
+    auto start = std::chrono::high_resolution_clock::now();
+    std::sort(data, data + n);
+    auto end = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration<double>(end - start).count();
+}
+
+
+template <typename T>
+float gpu_radix_sort(T* d_data, T* h_data,size_t n, void (*radix_func)(T*, size_t)) {
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaMemcpy(d_data, h_data, n * sizeof(T), cudaMemcpyHostToDevice));
+
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
+    radix_func(d_data, n);
+    cudaEventRecord(stop);
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+    float ms;
+    cudaEventElapsedTime(&ms, start, stop);
+
+    CUDA_CHECK(cudaMemcpy(h_data, d_data, n * sizeof(T), cudaMemcpyDeviceToHost));
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    return ms;
+}
+
+
+template <typename T>
+float gpu_thrust_sort(T* h_data, size_t n) {
+    cudaEvent_t start, stop;
+
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    thrust::device_vector<T> d_data(n);
+    CUDA_CHECK(cudaMemcpy(thrust::raw_pointer_cast(d_data.data()), h_data, n * sizeof(T), cudaMemcpyHostToDevice));
+
+    cudaEventRecord(start);
+    thrust::sort(d_data.begin(), d_data.end());
+    cudaEventRecord(stop);
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+    float ms;
+    cudaEventElapsedTime(&ms, start, stop);
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    return ms;
+}
+
+
+template<typename T>
+void benchmark(size_t n) {
+    using method = RadixMethods<T>;
+    T* h_data        = (T*)malloc(n * sizeof(T));
+    T* h_cpu         = (T*)malloc(n * sizeof(T));
+    T* h_gpu         = (T*)malloc(n * sizeof(T));
+    T* h_thrust      = (T*)malloc(n * sizeof(T));
+
+    T* d_data;
+    CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(T)));
+
+    generate_random_data(h_data, n, method::is_signed);
+    memcpy(h_cpu, h_data, n * sizeof(T));
+    memcpy(h_gpu, h_data, n * sizeof(T));
+    memcpy(h_thrust, h_data, n * sizeof(T));
+
+    double cpu_time = cpuSort(h_cpu, n);
+    float gpu_radix_time = gpu_radix_sort(d_data, h_gpu, n, method::sort);
+
+    bool correct = check_sorting(h_gpu, n);
+    if (!correct) {
+        printf("Benchmark: %s[%zu] FAILED\n\n", method::name, n);
+        free_all(h_data, h_cpu, h_gpu, h_thrust, d_data);
+        return;
+    }
+    float gpu_thrust_time = gpu_thrust_sort(h_thrust, n);
+    print_results(method::name, n, cpu_time, gpu_radix_time, gpu_thrust_time);
+    free_all(h_data, h_cpu, h_gpu, h_thrust, d_data);
 }
 
 
 int main() {
-    set<int> arraySizes = {1000, 100000, 5000000, 10000000};
+    srand(158);
 
-    for (const auto& size : arraySizes){
-        vector<int32_t> testData32 = generateRandomArray<int32_t>(size);
-        testSort<int32_t>(testData32, "int32_t");
+    size_t sizes[] = {1000, 100000, 5000000, 10000000};
 
-        vector<int64_t> testData64 = generateRandomArray<int64_t>(size);
-        testSort<int64_t>(testData64, "int64_t");
-
+    for (size_t n : sizes) {
+        benchmark<int32_t>(n);
+        benchmark<int64_t>(n);
+        benchmark<uint32_t>(n);
+        benchmark<uint64_t>(n);
     }
-
-    int uint_size = 5000000;
-    vector<uint32_t> testData32 = generateRandomArray<uint32_t>(uint_size);
-    testSort<uint32_t>(testData32, "uint32_t");
-
-    vector<uint64_t> testData64 = generateRandomArray<uint64_t>(uint_size);
-    testSort<uint64_t>(testData64, "uint64_t");
+    using method = RadixMethods<int32_t>;
 
     return 0;
 }
